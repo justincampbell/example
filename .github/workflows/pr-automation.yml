@@ -179,10 +179,8 @@ jobs:
             echo ""
             echo "Marking PR #$PR_NUMBER as ready for review..."
 
-            # Mark as ready for review
-            gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
-              -X PATCH \
-              -f draft=false
+            # Mark as ready for review using gh pr ready command
+            gh pr ready "$PR_NUMBER"
 
             echo "PR #$PR_NUMBER marked as ready for review"
 
