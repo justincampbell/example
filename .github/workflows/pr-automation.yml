@@ -116,7 +116,7 @@ jobs:
 
             # Get all check runs for this commit, excluding this workflow to avoid circular dependency
             check_runs=$(gh api "/repos/${{ github.repository }}/commits/${SHA}/check-runs" --paginate)
-            current_job_name="${{ github.job }}"
+            current_job_name="Ready When Green"
 
             # Count total checks and successful checks (excluding this workflow's own check)
             total_checks=$(echo "$check_runs" | jq --arg job "$current_job_name" '[.check_runs[] | select(.name != $job)] | length')
