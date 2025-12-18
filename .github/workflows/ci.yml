@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, test-* ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Run Tests
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run simple test
+        run: |
+          echo "Running tests..."
+          sleep 5  # Simulate some work
+          echo "Tests passed!"

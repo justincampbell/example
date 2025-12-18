@@ -1,0 +1,196 @@
+name: PR Automation
+
+on:
+  # Triggered when a check suite completes (GitHub Actions checks)
+  check_suite:
+    types: [completed]
+
+  # Triggered when external CI status updates
+  status:
+
+  # Triggered when the label is added (for immediate validation if checks already passed)
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+  checks: read
+  statuses: read
+
+jobs:
+  ready-when-green:
+    runs-on: ubuntu-latest
+    name: Ready When Green
+    # Only run when:
+    # - status event with 'success' state and has associated PRs
+    # - check_suite event with 'success' conclusion and has associated PRs
+    # - pull_request labeled event (immediate check when label added)
+    if: |
+      (github.event_name == 'status' && github.event.state == 'success' && github.event.branches[0].name != 'main') ||
+      (github.event_name == 'check_suite' && github.event.check_suite.conclusion == 'success' && github.event.check_suite.pull_requests[0].number != null) ||
+      (github.event_name == 'pull_request')
+
+    steps:
+      - name: Find associated PRs
+        id: find-prs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Extract the commit SHA and PR number from the event payload
+          # Different event types structure their data differently
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            # pull_request events include the PR number directly in the payload
+            SHA="${{ github.event.pull_request.head.sha }}"
+            PR_NUMBER="${{ github.event.pull_request.number }}"
+          elif [ "${{ github.event_name }}" = "status" ]; then
+            # status events only include the commit SHA
+            SHA="${{ github.event.sha }}"
+            PR_NUMBER=""
+          elif [ "${{ github.event_name }}" = "check_suite" ]; then
+            # check_suite events only include the commit SHA
+            SHA="${{ github.event.check_suite.head_sha }}"
+            PR_NUMBER=""
+          else
+            echo "Unexpected event type: ${{ github.event_name }}"
+            exit 0
+          fi
+
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+
+          # Find which PR(s) contain this commit
+          # For pull_request events, we already have the PR number
+          # For check_suite/status events, we need to look it up via the commits API
+          if [ -n "$PR_NUMBER" ]; then
+            echo "pr_numbers=$PR_NUMBER" >> $GITHUB_OUTPUT
+          else
+            # Use GitHub API to find PRs containing this specific commit
+            pr_numbers=$(gh api "/repos/${{ github.repository }}/commits/${SHA}/pulls" --jq '.[].number' | tr '\n' ' ')
+            if [ -z "$pr_numbers" ]; then
+              echo "No PRs found for SHA $SHA"
+              exit 0
+            fi
+            echo "pr_numbers=$pr_numbers" >> $GITHUB_OUTPUT
+          fi
+
+          echo "Found PRs: ${pr_numbers:-$PR_NUMBER}"
+
+      - name: Process each PR
+        if: steps.find-prs.outputs.pr_numbers != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="${{ steps.find-prs.outputs.sha }}"
+          PR_NUMBERS="${{ steps.find-prs.outputs.pr_numbers }}"
+
+          for PR_NUMBER in $PR_NUMBERS; do
+            echo ""
+            echo "========================================="
+            echo "Processing PR #$PR_NUMBER"
+            echo "========================================="
+
+            # Get PR details
+            pr_data=$(gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}")
+
+            is_draft=$(echo "$pr_data" | jq -r '.draft')
+            has_label=$(echo "$pr_data" | jq -r '.labels[].name' | grep -x "ready-when-green" || echo "")
+
+            echo "PR #$PR_NUMBER status:"
+            echo "  - Draft: $is_draft"
+            echo "  - Has 'ready-when-green' label: $([ -n "$has_label" ] && echo "yes" || echo "no")"
+
+            # Skip if not draft
+            if [ "$is_draft" != "true" ]; then
+              echo "PR #$PR_NUMBER is not a draft - skipping"
+              continue
+            fi
+
+            # Skip if doesn't have the label
+            if [ -z "$has_label" ]; then
+              echo "PR #$PR_NUMBER doesn't have 'ready-when-green' label - skipping"
+              continue
+            fi
+
+            echo ""
+            echo "Checking CI status for PR #$PR_NUMBER (SHA: $SHA)..."
+
+            # Get all check runs for this commit, excluding this workflow to avoid circular dependency
+            check_runs=$(gh api "/repos/${{ github.repository }}/commits/${SHA}/check-runs" --paginate)
+            current_job_name="${{ github.job }}"
+
+            # Count total checks and successful checks (excluding this workflow's own check)
+            total_checks=$(echo "$check_runs" | jq --arg job "$current_job_name" '[.check_runs[] | select(.name != $job)] | length')
+            successful_checks=$(echo "$check_runs" | jq --arg job "$current_job_name" '[.check_runs[] | select(.name != $job and .conclusion == "success")] | length')
+            failed_checks=$(echo "$check_runs" | jq --arg job "$current_job_name" '[.check_runs[] | select(.name != $job and .conclusion != "success" and .conclusion != null)] | length')
+            pending_checks=$(echo "$check_runs" | jq --arg job "$current_job_name" '[.check_runs[] | select(.name != $job and .status != "completed")] | length')
+
+            echo "GitHub Actions Checks:"
+            echo "  - Total: $total_checks"
+            echo "  - Successful: $successful_checks"
+            echo "  - Failed/Other: $failed_checks"
+            echo "  - Pending: $pending_checks"
+
+            # Get commit status (external checks)
+            commit_status=$(gh api "/repos/${{ github.repository }}/commits/${SHA}/status")
+
+            status_state=$(echo "$commit_status" | jq -r '.state')
+            total_statuses=$(echo "$commit_status" | jq '.statuses | length')
+
+            echo ""
+            echo "External CI Status:"
+            echo "  - Overall state: $status_state"
+            echo "  - Total statuses: $total_statuses"
+
+            if [ "$total_statuses" -gt 0 ]; then
+              echo "  - Status details:"
+              echo "$commit_status" | jq -r '.statuses[] | "    * \(.context): \(.state)"'
+            fi
+
+            # Determine if we should mark as ready
+            echo ""
+            echo "Evaluating readiness..."
+
+            # Check if there are any checks/statuses at all
+            if [ "$total_checks" -eq 0 ] && [ "$total_statuses" -eq 0 ]; then
+              echo "No checks or statuses found - not marking as ready for safety"
+              continue
+            fi
+
+            # Check GitHub Actions
+            if [ "$pending_checks" -gt 0 ]; then
+              echo "GitHub Actions checks are still pending - waiting"
+              continue
+            fi
+
+            if [ "$failed_checks" -gt 0 ]; then
+              echo "Some GitHub Actions checks have failed - not marking as ready"
+              continue
+            fi
+
+            # Check external statuses
+            if [ "$status_state" != "success" ]; then
+              echo "External CI status is '$status_state' (not 'success') - waiting"
+              continue
+            fi
+
+            # All checks passed!
+            echo ""
+            echo "All checks passed for PR #$PR_NUMBER!"
+            echo ""
+            echo "Marking PR #$PR_NUMBER as ready for review..."
+
+            # Mark as ready for review
+            gh api "/repos/${{ github.repository }}/pulls/${PR_NUMBER}" \
+              -X PATCH \
+              -f draft=false
+
+            echo "PR #$PR_NUMBER marked as ready for review"
+
+            # Remove the label
+            echo "Removing 'ready-when-green' label..."
+            gh api "/repos/${{ github.repository }}/issues/${PR_NUMBER}/labels/ready-when-green" -X DELETE || echo "Label may have already been removed"
+
+            echo "Label removed"
+            echo ""
+            echo "PR #$PR_NUMBER is now ready for review!"
+          done
