@@ -179,8 +179,20 @@ jobs:
             echo ""
             echo "Marking PR #$PR_NUMBER as ready for review..."
 
-            # Mark as ready for review using gh pr ready command
-            gh pr ready "$PR_NUMBER"
+            # Mark as ready for review using GraphQL mutation
+            # First get the PR node ID
+            pr_node_id=$(echo "$pr_data" | jq -r '.node_id')
+
+            # Use GraphQL to mark as ready
+            gh api graphql -f query='
+              mutation($prId: ID!) {
+                markPullRequestReadyForReview(input: {pullRequestId: $prId}) {
+                  pullRequest {
+                    id
+                    isDraft
+                  }
+                }
+              }' -f prId="$pr_node_id"
 
             echo "PR #$PR_NUMBER marked as ready for review"
 
