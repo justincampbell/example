@@ -167,8 +167,8 @@ jobs:
               continue
             fi
 
-            # Check external statuses
-            if [ "$status_state" != "success" ]; then
+            # Check external statuses (only if there are any)
+            if [ "$total_statuses" -gt 0 ] && [ "$status_state" != "success" ]; then
               echo "External CI status is '$status_state' (not 'success') - waiting"
               continue
             fi
